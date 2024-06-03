@@ -154,6 +154,8 @@ class InitProcessGroupKwargs(KwargsHandler):
     [method](https://pytorch.org/docs/stable/distributed.html#torch.distributed.init_process_group) for more
     information on each argument.
 
+    Note: If `timeout` is set to `None`, the default will be based upon how `backend` is set.
+
     ```python
     from datetime import timedelta
     from accelerate import Accelerator
@@ -166,7 +168,12 @@ class InitProcessGroupKwargs(KwargsHandler):
 
     backend: Optional[str] = "nccl"
     init_method: Optional[str] = None
-    timeout: timedelta = timedelta(seconds=1800)
+    timeout: Optional[timedelta] = None
+
+    def __post_init__(self):
+        if self.timeout is None:
+            seconds = 1800 if self.backend != "nccl" else 600
+            self.timeout = timedelta(seconds=seconds)
 
 
 # Literals
@@ -315,6 +322,7 @@ class DistributedType(str, enum.Enum):
         - **NO** -- Not a distributed environment, just a single process.
         - **MULTI_CPU** -- Distributed on multiple CPU nodes.
         - **MULTI_GPU** -- Distributed on multiple GPUs.
+        - **MULTI_MLU** -- Distributed on multiple MLUs.
         - **MULTI_NPU** -- Distributed on multiple NPUs.
         - **MULTI_XPU** -- Distributed on multiple XPUs.
         - **DEEPSPEED** -- Using DeepSpeed.
@@ -327,6 +335,7 @@ class DistributedType(str, enum.Enum):
     MULTI_CPU = "MULTI_CPU"
     MULTI_GPU = "MULTI_GPU"
     MULTI_NPU = "MULTI_NPU"
+    MULTI_MLU = "MULTI_MLU"
     MULTI_XPU = "MULTI_XPU"
     DEEPSPEED = "DEEPSPEED"
     FSDP = "FSDP"
@@ -369,7 +378,7 @@ class ComputeEnvironment(str, enum.Enum):
 
 class DynamoBackend(str, BaseEnum):
     """
-    Represents a dynamo backend (see https://github.com/pytorch/torchdynamo).
+    Represents a dynamo backend (see https://pytorch.org/docs/stable/torch.compiler.html).
 
     Values:
 
@@ -456,6 +465,7 @@ class PrecisionType(BaseEnum):
 class RNGType(BaseEnum):
     TORCH = "torch"
     CUDA = "cuda"
+    MLU = "mlu"
     NPU = "npu"
     XLA = "xla"
     XPU = "xpu"
@@ -469,6 +479,7 @@ class CustomDtype(enum.Enum):
 
     FP8 = "fp8"
     INT4 = "int4"
+    INT2 = "int2"
 
 
 # data classes
@@ -518,6 +529,14 @@ class DataLoaderConfiguration:
             "Ensures training results are fully reproducable using a different sampling technique. "
             "While seed-to-seed results may differ, on average the differences are neglible when using"
             "multiple different seeds to compare. Should also be ran with [`~utils.set_seed`] for the best results."
+        },
+    )
+    non_blocking: bool = field(
+        default=False,
+        metadata={
+            "help": "If set to `True`, the dataloader prepared by the Accelerator will utilize non-blocking host-to-device"
+            " transfers, allowing for better overlap between dataloader communication and computation.  Recommended that the"
+            " prepared dataloader has `pin_memory` set to `True` to work properly."
         },
     )
 
@@ -573,7 +592,29 @@ class ProjectConfiguration:
 @dataclass
 class GradientAccumulationPlugin(KwargsHandler):
     """
-    A plugin to configure gradient accumulation behavior.
+    A plugin to configure gradient accumulation behavior. You can only pass one of `gradient_accumulation_plugin` or
+    `gradient_accumulation_steps` to [`Accelerator`]. Passing both raises an error.
+
+    Parameters:
+        num_steps (`int`):
+            The number of steps to accumulate gradients for.
+        adjust_scheduler (`bool`, *optional*, defaults to `True`):
+            Whether to adjust the scheduler steps to account for the number of steps being accumulated. Should be
+            `True` if the used scheduler was not adjusted for gradient accumulation.
+        sync_with_dataloader (`bool`, *optional*, defaults to `True`):
+            Whether to synchronize setting the gradients when at the end of the dataloader.
+        sync_each_batch (`bool`, *optional*):
+                Whether to synchronize setting the gradients at each data batch. Seting to `True` may reduce memory
+                requirements when using gradient accumulation with distributed training, at expense of speed.
+
+    Example:
+
+    ```python
+    from accelerate.utils import GradientAccumulationPlugin
+
+    gradient_accumulation_plugin = GradientAccumulationPlugin(num_steps=2)
+    accelerator = Accelerator(gradient_accumulation_plugin=gradient_accumulation_plugin)
+    ```
     """
 
     num_steps: int = field(default=None, metadata={"help": "The number of steps to accumulate gradients for."})
@@ -587,6 +628,12 @@ class GradientAccumulationPlugin(KwargsHandler):
         default=True,
         metadata={
             "help": "Whether to synchronize setting the gradients when at the end of the dataloader. Should only be set to `False` if you know what you're doing."
+        },
+    )
+    sync_each_batch: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to synchronize setting the gradients at each data batch. Setting to `True` may reduce memory requirements when using gradient accumulation with distributed training, at expense of speed."
         },
     )
 
@@ -650,15 +697,15 @@ class DeepSpeedPlugin:
         default=None,
         metadata={"help": "Possible options are 0,1,2,3; Default will be taken from environment variable"},
     )
-    is_train_batch_min: str = field(
+    is_train_batch_min: bool = field(
         default=True,
         metadata={"help": "If both train & eval dataloaders are specified, this will decide the train_batch_size"},
     )
-    offload_optimizer_device: bool = field(
+    offload_optimizer_device: str = field(
         default=None,
         metadata={"help": "Possible options are none|cpu|nvme. Only applicable with ZeRO Stages 2 and 3."},
     )
-    offload_param_device: bool = field(
+    offload_param_device: str = field(
         default=None,
         metadata={"help": "Possible options are none|cpu|nvme. Only applicable with ZeRO Stage 3."},
     )
@@ -681,6 +728,13 @@ class DeepSpeedPlugin:
         default=None,
         metadata={"help": "Flag to indicate whether to save 16-bit model. Only applicable with ZeRO Stage-3."},
     )
+    transformer_moe_cls_names: str = field(
+        default=None,
+        metadata={
+            "help": "comma-separated list of transformers MoE layer class names (case-sensitive), e.g : "
+            " `MixtralSparseMoeBlock`, `Qwen2MoeSparseMoeBlock`, `JetMoEAttention,JetMoEBlock` ..."
+        },
+    )
 
     def __post_init__(self):
         from .deepspeed import HfDeepSpeedConfig
@@ -690,9 +744,8 @@ class DeepSpeedPlugin:
             self.gradient_accumulation_steps = int(gas) if gas.isdigit() else gas
 
         if self.gradient_clipping is None:
-            gradient_clipping = os.environ.get("ACCELERATE_GRADIENT_CLIPPING", "none")
-            if gradient_clipping != "none":
-                self.gradient_clipping = float(gradient_clipping)
+            gradient_clipping = os.environ.get("ACCELERATE_GRADIENT_CLIPPING", "auto")
+            self.gradient_clipping = gradient_clipping if gradient_clipping == "auto" else float(gradient_clipping)
 
         if self.zero_stage is None:
             self.zero_stage = int(os.environ.get("ACCELERATE_DEEPSPEED_ZERO_STAGE", 2))
@@ -936,6 +989,26 @@ class DeepSpeedPlugin:
                 "It will only ask for the necessary config variables when using `deepspeed_config_file`."
             )
 
+    def set_moe_leaf_modules(self, model):
+        if self.transformer_moe_cls_names is None:
+            self.transformer_moe_cls_names = os.environ.get("ACCELERATE_DEEPSPEED_MOE_LAYER_CLS_NAMES", None)
+        if self.transformer_moe_cls_names is not None:
+            if compare_versions("deepspeed", "<", "0.14.0"):
+                raise ImportError("DeepSpeed version must be >= 0.14.0 to use MOE support. Please update DeepSpeed.")
+            from deepspeed.utils import set_z3_leaf_modules
+
+            class_names = self.transformer_moe_cls_names.split(",")
+            transformer_moe_cls = []
+            for layer_class in class_names:
+                transformer_cls = get_module_class_from_name(model, layer_class)
+                if transformer_cls is None:
+                    raise Exception(
+                        f"Could not find a transformer layer class called '{layer_class}' to wrap in the model."
+                    )
+                else:
+                    transformer_moe_cls.append(transformer_cls)
+            set_z3_leaf_modules(model, transformer_moe_cls)  # z3_leaf
+
 
 @dataclass
 class FullyShardedDataParallelPlugin:
@@ -1077,6 +1150,13 @@ class FullyShardedDataParallelPlugin:
         self.forward_prefetch = str_to_bool(os.environ.get(prefix + "FORWARD_PREFETCH", "False")) == 1
         self.activation_checkpointing = str_to_bool(os.environ.get(prefix + "ACTIVATION_CHECKPOINTING", "False")) == 1
 
+        if str_to_bool(os.environ.get("FSDP_CPU_RAM_EFFICIENT_LOADING", "False")) == 1 and not self.sync_module_states:
+            warnings.warn(
+                "sync_module_states cannot be False since efficient cpu ram loading enabled. "
+                "Setting sync_module_states to True."
+            )
+            self.sync_module_states = True
+
         if self.sync_module_states:
             if is_npu_available():
                 device = torch.npu.current_device()
@@ -1089,26 +1169,6 @@ class FullyShardedDataParallelPlugin:
                     "There are currently no available devices found, must be one of 'XPU', 'CUDA', or 'NPU'."
                 )
             self.param_init_fn = lambda x: x.to_empty(device=device, recurse=False)
-
-    @staticmethod
-    def get_module_class_from_name(module, name):
-        """
-        Gets a class from a module by its name.
-
-        Args:
-            module (`torch.nn.Module`): The module to get the class from.
-            name (`str`): The name of the class.
-        """
-        modules_children = list(module.children())
-        if module.__class__.__name__ == name:
-            return module.__class__
-        elif len(modules_children) == 0:
-            return
-        else:
-            for child_module in modules_children:
-                module_class = FullyShardedDataParallelPlugin.get_module_class_from_name(child_module, name)
-                if module_class is not None:
-                    return module_class
 
     def set_auto_wrap_policy(self, model):
         from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
@@ -1124,7 +1184,7 @@ class FullyShardedDataParallelPlugin:
                 ).split(",")
                 transformer_cls_to_wrap = set()
                 for layer_class in transformer_cls_names_to_wrap:
-                    transformer_cls = FullyShardedDataParallelPlugin.get_module_class_from_name(model, layer_class)
+                    transformer_cls = get_module_class_from_name(model, layer_class)
                     if transformer_cls is None:
                         raise Exception("Could not find the transformer layer class to wrap in the model.")
                     else:
@@ -1142,22 +1202,33 @@ class FullyShardedDataParallelPlugin:
                         size_based_auto_wrap_policy, min_num_params=min_num_params
                     )
 
-    def set_mixed_precision(self, mixed_precision):
-        if mixed_precision == "fp16":
-            dtype = torch.float16
-        elif mixed_precision == "bf16":
-            dtype = torch.bfloat16
+    def set_mixed_precision(self, mixed_precision, buffer_autocast=False, override=False):
+        if isinstance(mixed_precision, str):
+            if mixed_precision == "fp16":
+                dtype = torch.float16
+            elif mixed_precision == "bf16":
+                dtype = torch.bfloat16
+            elif mixed_precision == "fp32":
+                dtype = torch.float32
+            else:
+                raise ValueError(f"Unknown mixed precision value: {mixed_precision}")
         else:
-            raise ValueError(f"Unknown mixed precision value: {mixed_precision}")
+            dtype = mixed_precision
+
+        buffer_dtype = torch.float32 if buffer_autocast else dtype
         from torch.distributed.fsdp.fully_sharded_data_parallel import MixedPrecision
 
-        if self.mixed_precision_policy is None:
-            self.mixed_precision_policy = MixedPrecision(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
+        if self.mixed_precision_policy is None or override:
+            self.mixed_precision_policy = MixedPrecision(
+                param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=buffer_dtype
+            )
 
     def set_state_dict_type(self, state_dict_type_policy):
         from torch.distributed.fsdp.fully_sharded_data_parallel import (
             FullOptimStateDictConfig,
             FullStateDictConfig,
+            ShardedOptimStateDictConfig,
+            ShardedStateDictConfig,
             StateDictType,
         )
 
@@ -1168,6 +1239,11 @@ class FullyShardedDataParallelPlugin:
                 self.state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
             if self.optim_state_dict_config is None:
                 self.optim_state_dict_config = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        elif self.state_dict_type == StateDictType.SHARDED_STATE_DICT:
+            if self.state_dict_config is None:
+                self.state_dict_config = ShardedStateDictConfig(offload_to_cpu=True)
+            if self.optim_state_dict_config is None:
+                self.optim_state_dict_config = ShardedOptimStateDictConfig(offload_to_cpu=True)
 
 
 @dataclass
@@ -1720,3 +1796,23 @@ class BnbQuantizationConfig:
 
         if not isinstance(self.torch_dtype, torch.dtype):
             raise ValueError("torch_dtype must be a torch.dtype")
+
+
+def get_module_class_from_name(module, name):
+    """
+    Gets a class from a module by its name.
+
+    Args:
+        module (`torch.nn.Module`): The module to get the class from.
+        name (`str`): The name of the class.
+    """
+    modules_children = list(module.children())
+    if module.__class__.__name__ == name:
+        return module.__class__
+    elif len(modules_children) == 0:
+        return
+    else:
+        for child_module in modules_children:
+            module_class = get_module_class_from_name(child_module, name)
+            if module_class is not None:
+                return module_class

@@ -45,7 +45,7 @@ def load_config_from_file(config_file):
         if not os.path.isfile(config_file):
             raise FileNotFoundError(
                 f"The passed configuration file `{config_file}` does not exist. "
-                "Please pass an existing file to `accelerate launch`, or use the the default one "
+                "Please pass an existing file to `accelerate launch`, or use the default one "
                 "created through `accelerate config` and run `accelerate launch` "
                 "without the `--config_file` argument."
             )
@@ -109,6 +109,8 @@ class BaseConfig:
             config_dict["use_cpu"] = False
         if "debug" not in config_dict:
             config_dict["debug"] = False
+        if "enable_cpu_affinity" not in config_dict:
+            config_dict["enable_cpu_affinity"] = False
         extra_keys = sorted(set(config_dict.keys()) - set(cls.__dataclass_fields__.keys()))
         if len(extra_keys) > 0:
             raise ValueError(
@@ -143,6 +145,8 @@ class BaseConfig:
             config_dict["use_cpu"] = False
         if "debug" not in config_dict:
             config_dict["debug"] = False
+        if "enable_cpu_affinity" not in config_dict:
+            config_dict["enable_cpu_affinity"] = False
         extra_keys = sorted(set(config_dict.keys()) - set(cls.__dataclass_fields__.keys()))
         if len(extra_keys) > 0:
             raise ValueError(
@@ -163,7 +167,7 @@ class BaseConfig:
                 self.distributed_type = SageMakerDistributedType(self.distributed_type)
             else:
                 self.distributed_type = DistributedType(self.distributed_type)
-        if self.dynamo_config is None:
+        if getattr(self, "dynamo_config", None) is None:
             self.dynamo_config = {}
 
 
@@ -178,6 +182,7 @@ class ClusterConfig(BaseConfig):
     rdzv_backend: Optional[str] = "static"
     same_network: Optional[bool] = False
     main_training_function: str = "main"
+    enable_cpu_affinity: bool = False
 
     # args for deepspeed_plugin
     deepspeed_config: dict = None
@@ -187,6 +192,8 @@ class ClusterConfig(BaseConfig):
     megatron_lm_config: dict = None
     # args for ipex
     ipex_config: dict = None
+    # args for mpirun
+    mpirun_config: dict = None
     # args for TPU
     downcast_bf16: bool = False
 
@@ -212,6 +219,8 @@ class ClusterConfig(BaseConfig):
             self.megatron_lm_config = {}
         if self.ipex_config is None:
             self.ipex_config = {}
+        if self.mpirun_config is None:
+            self.mpirun_config = {}
         return super().__post_init__()
 
 
@@ -232,3 +241,4 @@ class SageMakerConfig(BaseConfig):
     sagemaker_metrics_file: str = None
     additional_args: dict = None
     dynamo_config: dict = None
+    enable_cpu_affinity: bool = False

@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import tempfile
+import warnings
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -32,7 +33,14 @@ import torch.nn as nn
 from ..state import AcceleratorState
 from .constants import SAFE_WEIGHTS_NAME, WEIGHTS_NAME
 from .dataclasses import AutocastKwargs, CustomDtype, DistributedType
-from .imports import is_mps_available, is_npu_available, is_peft_available, is_torch_xla_available, is_xpu_available
+from .imports import (
+    is_mlu_available,
+    is_mps_available,
+    is_npu_available,
+    is_peft_available,
+    is_torch_xla_available,
+    is_xpu_available,
+)
 from .offload import load_offloaded_weight, offload_weight, save_offload_index
 from .tqdm import is_tqdm_available, tqdm
 from .versions import compare_versions
@@ -40,6 +48,9 @@ from .versions import compare_versions
 
 if is_npu_available(check_device=False):
     import torch_npu  # noqa: F401
+
+if is_mlu_available(check_device=False):
+    import torch_mlu  # noqa: F401
 
 from safetensors import safe_open
 from safetensors.torch import load_file as safe_load_file
@@ -100,7 +111,7 @@ def convert_file_size_to_int(size: Union[int, str]):
     1048576
     ```
     """
-    mem_size = 0
+    mem_size = -1
     err_msg = (
         f"`size` {size} is not in a valid format. Use an integer for bytes, or a string with an unit (like '5.0GB')."
     )
@@ -125,7 +136,7 @@ def convert_file_size_to_int(size: Union[int, str]):
     except ValueError:
         raise ValueError(err_msg)
 
-    if mem_size <= 0:
+    if mem_size < 0:
         raise ValueError(err_msg)
     return mem_size
 
@@ -143,6 +154,8 @@ def dtype_byte_size(dtype: torch.dtype):
     """
     if dtype == torch.bool:
         return 1 / 8
+    elif dtype == CustomDtype.INT2:
+        return 1 / 4
     elif dtype == CustomDtype.INT4:
         return 1 / 2
     elif dtype == CustomDtype.FP8:
@@ -368,10 +381,13 @@ def set_module_tensor_to_device(
             device_quantization = device
             device = "cpu"
         # `torch.Tensor.to(<int num>)` is not supported by `torch_npu` (see this [issue](https://github.com/Ascend/pytorch/issues/16)).
-        if is_npu_available() and isinstance(device, int):
-            device = f"npu:{device}"
-        if is_xpu_available() and isinstance(device, int):
-            device = f"xpu:{device}"
+        if isinstance(device, int):
+            if is_npu_available():
+                device = f"npu:{device}"
+            elif is_mlu_available():
+                device = f"mlu:{device}"
+            elif is_xpu_available():
+                device = f"xpu:{device}"
         if value is None:
             new_value = old_value.to(device)
             if dtype is not None and device in ["meta", torch.device("meta")]:
@@ -402,6 +418,8 @@ def set_module_tensor_to_device(
                     new_value.SCB = new_value.SCB.to("cpu")
                 else:
                     new_value = param_cls(new_value, requires_grad=old_value.requires_grad, **kwargs).to(device)
+            elif param_cls.__name__ in ["QTensor", "QBitsTensor"]:
+                new_value = torch.nn.Parameter(new_value, requires_grad=old_value.requires_grad).to(device)
             else:
                 new_value = param_cls(new_value, requires_grad=old_value.requires_grad).to(device)
 
@@ -424,18 +442,25 @@ def set_module_tensor_to_device(
                     elif module.bias is None:
                         # if no bias exists, we can quantize right away
                         module = module.cuda(device_index)
-            elif module.__class__.__name__ == "Linear4bit" and getattr(module.weight, "quant_state", None) is None:
+            elif (
+                module.__class__.__name__ == "Linear4bit"
+                and getattr(module.weight, "quant_state", None) is None
+                and str(module.weight.device) != "meta"
+            ):
                 # quantize only if necessary
                 device_index = torch.device(device).index if torch.device(device).type == "cuda" else None
                 if not getattr(module.weight, "quant_state", None) and device_index is not None:
                     module.weight = module.weight.cuda(device_index)
     # clean pre and post foward hook
-    if is_npu_available():
-        torch.npu.empty_cache()
-    elif is_xpu_available():
-        torch.xpu.empty_cache()
-    else:
-        torch.cuda.empty_cache()
+    if device != "cpu":
+        if is_npu_available():
+            torch.npu.empty_cache()
+        elif is_mlu_available():
+            torch.mlu.empty_cache()
+        elif is_xpu_available():
+            torch.xpu.empty_cache()
+        else:
+            torch.cuda.empty_cache()
 
     # When handling tied weights, we update tied_params_map to keep track of the tied weights that have already been allocated on the device in
     # order to avoid duplicating memory, see above.
@@ -686,6 +711,7 @@ def compute_module_sizes(
     model: nn.Module,
     dtype: Optional[Union[str, torch.device]] = None,
     special_dtypes: Optional[Dict[str, Union[str, torch.device]]] = None,
+    buffers_only: bool = False,
 ):
     """
     Compute the size of each submodule of a given model.
@@ -697,7 +723,15 @@ def compute_module_sizes(
         special_dtypes = {key: _get_proper_dtype(dtyp) for key, dtyp in special_dtypes.items()}
         special_dtypes_size = {key: dtype_byte_size(dtyp) for key, dtyp in special_dtypes.items()}
     module_sizes = defaultdict(int)
-    for name, tensor in named_module_tensors(model, recurse=True):
+
+    module_list = []
+
+    if not buffers_only:
+        module_list = named_module_tensors(model, recurse=True)
+    else:
+        module_list = model.named_buffers(recurse=True)
+
+    for name, tensor in module_list:
         if special_dtypes is not None and name in special_dtypes:
             size = tensor.numel() * special_dtypes_size[name]
         elif dtype is None:
@@ -713,6 +747,18 @@ def compute_module_sizes(
             module_sizes[".".join(name_parts[:idx])] += size
 
     return module_sizes
+
+
+def compute_module_total_buffer_size(
+    model: nn.Module,
+    dtype: Optional[Union[str, torch.device]] = None,
+    special_dtypes: Optional[Dict[str, Union[str, torch.device]]] = None,
+):
+    """
+    Compute the total size of buffers in each submodule of a given model.
+    """
+    module_sizes = compute_module_sizes(model, dtype=dtype, special_dtypes=special_dtypes, buffers_only=True)
+    return module_sizes.get("", 0)
 
 
 def get_max_layer_size(
@@ -761,23 +807,40 @@ def get_max_memory(max_memory: Optional[Dict[Union[int, str], Union[int, str]]] 
     import psutil
 
     if max_memory is None:
-        if not (torch.cuda.is_available() or is_npu_available() or is_xpu_available()):
-            max_memory = {}
-
-        else:
-            # Make sure CUDA is initialized on each GPU to have the right memory info.
-            if is_npu_available():
-                for i in range(torch.npu.device_count()):
+        max_memory = {}
+        # Make sure CUDA is initialized on each GPU to have the right memory info.
+        if is_npu_available():
+            for i in range(torch.npu.device_count()):
+                try:
                     _ = torch.tensor(0, device=torch.device("npu", i))
-                max_memory = {i: torch.npu.mem_get_info(i)[0] for i in range(torch.npu.device_count())}
-            elif is_xpu_available():
-                for i in range(torch.xpu.device_count()):
+                    max_memory[i] = torch.npu.mem_get_info(i)[0]
+                except Exception:
+                    logger.info(f"Device {i} seems unavailable, Proceeding to check subsequent devices.")
+                    continue
+        elif is_mlu_available():
+            for i in range(torch.mlu.device_count()):
+                try:
+                    _ = torch.tensor(0, device=torch.device("mlu", i))
+                    max_memory[i] = torch.mlu.mem_get_info(i)[0]
+                except Exception:
+                    logger.info(f"Device {i} seems unavailable, Proceeding to check subsequent devices.")
+                    continue
+        elif is_xpu_available():
+            for i in range(torch.xpu.device_count()):
+                try:
                     _ = torch.tensor(0, device=torch.device("xpu", i))
-                max_memory = {i: torch.xpu.max_memory_allocated(i) for i in range(torch.xpu.device_count())}
-            else:
-                for i in range(torch.cuda.device_count()):
+                    max_memory[i] = torch.xpu.max_memory_allocated(i)
+                except Exception:
+                    logger.info(f"Device {i} seems unavailable, Proceeding to check subsequent devices.")
+                    continue
+        else:
+            for i in range(torch.cuda.device_count()):
+                try:
                     _ = torch.tensor([0], device=i)
-                max_memory = {i: torch.cuda.mem_get_info(i)[0] for i in range(torch.cuda.device_count())}
+                    max_memory[i] = torch.cuda.mem_get_info(i)[0]
+                except Exception:
+                    logger.info(f"Device {i} seems unavailable, Proceeding to check subsequent devices.")
+                    continue
         # allocate everything in the mps device as the RAM is shared
         if is_mps_available():
             max_memory["mps"] = psutil.virtual_memory().available
@@ -796,6 +859,8 @@ def get_max_memory(max_memory: Optional[Dict[Union[int, str], Union[int, str]]] 
     # check if gpu/npu/xpu devices are available and if not, throw a warning
     if is_npu_available():
         num_devices = torch.npu.device_count()
+    elif is_mlu_available():
+        num_devices = torch.mlu.device_count()
     elif is_xpu_available():
         num_devices = torch.xpu.device_count()
     else:
@@ -868,6 +933,17 @@ def load_offloaded_weights(model, index, offload_folder):
         set_module_tensor_to_device(model, param_name, "cpu", value=weight, fp16_statistics=fp16_statistics)
 
 
+def get_module_leaves(module_sizes):
+    module_children = {}
+    for module in module_sizes:
+        if module == "" or "." not in module:
+            continue
+        parent = module.rsplit(".", 1)[0]
+        module_children[parent] = module_children.get(parent, 0) + 1
+    leaves = [module for module in module_sizes if module_children.get(module, 0) == 0 and module != ""]
+    return leaves
+
+
 def get_balanced_memory(
     model: nn.Module,
     max_memory: Optional[Dict[Union[int, str], Union[int, str]]] = None,
@@ -910,6 +986,8 @@ def get_balanced_memory(
 
     if is_npu_available():
         num_devices = len([d for d in max_memory if torch.device(d).type == "npu" and max_memory[d] > 0])
+    elif is_mlu_available():
+        num_devices = len([d for d in max_memory if torch.device(d).type == "mlu" and max_memory[d] > 0])
     elif is_xpu_available():
         num_devices = len(
             [
@@ -975,10 +1053,10 @@ def get_balanced_memory(
         buffer = 0
 
     # Compute mean of final modules. In the first dict of module sizes, leaves are the parameters
-    leaves = [n for n in module_sizes if len([p for p in module_sizes if n == "" or p.startswith(n + ".")]) == 0]
+    leaves = get_module_leaves(module_sizes)
     module_sizes = {n: v for n, v in module_sizes.items() if n not in leaves}
     # Once removed, leaves are the final modules.
-    leaves = [n for n in module_sizes if len([p for p in module_sizes if n == "" or p.startswith(n + ".")]) == 0]
+    leaves = get_module_leaves(module_sizes)
     mean_leaves = int(sum([module_sizes[n] for n in leaves]) / max(len(leaves), 1))
     buffer = int(1.25 * max(buffer, mean_leaves))
     per_gpu += buffer
@@ -1026,6 +1104,7 @@ def infer_auto_device_map(
     special_dtypes: Optional[Dict[str, Union[str, torch.dtype]]] = None,
     verbose: bool = False,
     clean_result: bool = True,
+    offload_buffers: bool = False,
 ):
     """
     Compute a device map for a given model giving priority to GPUs, then offload on CPU and finally offload to disk,
@@ -1062,6 +1141,9 @@ def infer_auto_device_map(
             Whether or not to provide debugging statements as the function builds the device_map.
         clean_result (`bool`, *optional*, defaults to `True`):
             Clean the resulting device_map by grouping all submodules that go on the same device together.
+        offload_buffers (`bool`, *optional*, defaults to `False`):
+            In the layers that are offloaded on the CPU or the hard drive, whether or not to offload the buffers as
+            well as the parameters.
     """
     # Get default / clean up max_memory
     max_memory = get_max_memory(max_memory)
@@ -1094,6 +1176,8 @@ def infer_auto_device_map(
     device_map = OrderedDict()
     current_device = 0
     current_memory_used = 0
+    device_memory_used = {}
+    device_buffer_sizes = {}
 
     # Direct submodules and parameters
     modules_to_treat = (
@@ -1143,13 +1227,19 @@ def infer_auto_device_map(
 
         device = devices[current_device]
         current_max_size = max_memory[device] if device != "disk" else None
+        current_memory_reserved = 0
         # Reduce max size available by the largest layer.
         if devices[current_device] in main_devices:
             current_max_size = current_max_size - max_layer_size
+            current_memory_reserved = max_layer_size
         # Case 1 -> We're too big!
         if current_max_size is not None and current_memory_used + module_size > current_max_size:
             # Split or not split?
-            modules_children = [] if isinstance(module, nn.Parameter) else list(module.named_children())
+            modules_children = (
+                []
+                if isinstance(module, nn.Parameter) or isinstance(module, torch.Tensor)
+                else list(module.named_children())
+            )
             if verbose:
                 print(
                     f"Not enough space on {devices[current_device]} to put {name} (space available "
@@ -1159,6 +1249,8 @@ def infer_auto_device_map(
                 # -> no split, we go to the next device
                 if verbose:
                     print("This module cannot be split, going to the next device.")
+
+                device_memory_used[device] = current_memory_used + current_memory_reserved
                 current_device += 1
                 modules_to_treat = [(name, module)] + modules_to_treat
                 current_memory_used = 0
@@ -1210,6 +1302,12 @@ def infer_auto_device_map(
                         modules_to_treat.pop(tied_module_index)
                     device_map[tied_module_name] = devices[current_device]
 
+                if not offload_buffers and isinstance(module, nn.Module):
+                    current_buffer_size = compute_module_total_buffer_size(
+                        module, dtype=dtype, special_dtypes=special_dtypes
+                    )
+                    device_buffer_sizes[device] = device_buffer_sizes.get(device, 0) + current_buffer_size
+
             else:
                 # We don't fit with the tied modules. Next question is: can we split one of the tied modules to make it
                 # smaller or do we need to go on the next device?
@@ -1250,6 +1348,8 @@ def infer_auto_device_map(
                     # If the tied module is not split, we go to the next device
                     if verbose:
                         print("None of the tied module can be split, going to the next device.")
+
+                    device_memory_used[device] = current_memory_used + current_memory_reserved
                     current_device += 1
                     modules_to_treat = [(name, module)] + modules_to_treat
                     current_memory_used = 0
@@ -1264,10 +1364,38 @@ def infer_auto_device_map(
                         f"(available={current_max_size - current_memory_used})."
                     )
             current_memory_used += module_size
+            device_memory_used[device] = current_memory_used + current_memory_reserved
             device_map[name] = devices[current_device]
+
+            if not offload_buffers and isinstance(module, nn.Module):
+                current_buffer_size = compute_module_total_buffer_size(
+                    module, dtype=dtype, special_dtypes=special_dtypes
+                )
+                device_buffer_sizes[device] = device_buffer_sizes.get(device, 0) + current_buffer_size
 
     if clean_result:
         device_map = clean_device_map(device_map)
+
+    non_gpu_buffer_size = device_buffer_sizes.get("cpu", 0) + device_buffer_sizes.get("disk", 0)
+    if non_gpu_buffer_size > 0 and not offload_buffers:
+        is_buffer_fit_any_gpu = False
+        for gpu_device, gpu_max_memory in max_memory.items():
+            if gpu_device == "cpu" or gpu_device == "disk":
+                continue
+
+            if not is_buffer_fit_any_gpu:
+                gpu_memory_used = device_memory_used.get(gpu_device, 0)
+
+                if gpu_max_memory >= non_gpu_buffer_size + gpu_memory_used:
+                    is_buffer_fit_any_gpu = True
+
+        if len(gpus) > 0 and not is_buffer_fit_any_gpu:
+            warnings.warn(
+                f"Current model requires {non_gpu_buffer_size} bytes of buffer for offloaded layers, which seems does "
+                f"not fit any GPU's remaining memory. If you are experiencing a OOM later, please consider using "
+                f"offload_buffers=True."
+            )
+
     return device_map
 
 
@@ -1438,6 +1566,49 @@ def get_state_dict_offloaded_model(model: nn.Module):
     return state_dict
 
 
+def get_state_dict_from_offload(
+    module: nn.Module,
+    module_name: str,
+    state_dict: Dict[str, Union[str, torch.tensor]],
+    device_to_put_offload: Union[int, str, torch.device] = "cpu",
+):
+    """
+    Retrieve the state dictionary (with parameters) from an offloaded module and load into a specified device (defualts
+    to cpu).
+
+    Args:
+        module: (`torch.nn.Module`):
+            The module we want to retrieve a state dictionary from
+        module_name: (`str`):
+            The name of the module of interest
+        state_dict (`Dict[str, Union[int, str, torch.device]]`):
+            Dictionary of {module names: parameters}
+        device_to_put_offload (`Union[int, str, torch.device]`):
+            Device to load offloaded parameters into, defaults to the cpu.
+    """
+    from ..hooks import AlignDevicesHook
+
+    root = module_name[: module_name.rfind(".")]  # module name without .weight or .bias
+    preforward = False
+    if hasattr(module, "_hf_hook") and isinstance(module._hf_hook, AlignDevicesHook) and module._hf_hook.offload:
+        # assign the device to which the offloaded parameters will be sent
+        original_device = module._hf_hook.execution_device
+        module._hf_hook.execution_device = device_to_put_offload
+        module._hf_hook.pre_forward(module)
+        preforward = True
+
+    for m_key in module.state_dict():
+        params = module.state_dict()[m_key]
+        if (root + f".{m_key}") in state_dict:
+            state_dict[root + f".{m_key}"] = params
+
+    if preforward:
+        module._hf_hook.post_forward(module, torch.tensor([]))
+        module._hf_hook.execution_device = original_device
+
+    return state_dict
+
+
 def load_checkpoint_in_model(
     model: nn.Module,
     checkpoint: Union[str, os.PathLike],
@@ -1448,6 +1619,7 @@ def load_checkpoint_in_model(
     offload_buffers: bool = False,
     keep_in_fp32_modules: List[str] = None,
     offload_8bit_bnb: bool = False,
+    strict: bool = False,
 ):
     """
     Loads a (potentially sharded) checkpoint inside a model, potentially sending weights to a given device as they are
@@ -1485,6 +1657,9 @@ def load_checkpoint_in_model(
             A list of the modules that we keep in `torch.float32` dtype.
         offload_8bit_bnb (`bool`, *optional*):
             Whether or not to enable offload of 8-bit modules on cpu/disk.
+        strict (`bool`, *optional*, defaults to `False`):
+            Whether to strictly enforce that the keys in the checkpoint state_dict match the keys of the model's
+            state_dict.
 
     """
     if offload_8bit_bnb:
@@ -1562,16 +1737,24 @@ def load_checkpoint_in_model(
         state_dict_folder = tempfile.mkdtemp()
         state_dict_index = {}
 
+    unexpected_keys = set()
+    model_keys = set(model.state_dict().keys())
     buffer_names = [name for name, _ in model.named_buffers()]
     for checkpoint_file in checkpoint_files:
-        checkpoint = load_state_dict(checkpoint_file, device_map=device_map)
+        loaded_checkpoint = load_state_dict(checkpoint_file, device_map=device_map)
         if device_map is None:
-            model.load_state_dict(checkpoint, strict=False)
+            model.load_state_dict(loaded_checkpoint, strict=strict)
+            unexpected_keys.update(set(loaded_checkpoint.keys()) - model_keys)
         else:
-            for param_name, param in checkpoint.items():
+            for param_name, param in loaded_checkpoint.items():
                 # skip SCB parameter (for 8-bit serialization)
                 if "SCB" in param_name:
                     continue
+
+                if param_name not in model_keys:
+                    unexpected_keys.add(param_name)
+                    if not strict:
+                        continue  # Skip loading this parameter.
 
                 module_name = param_name
 
@@ -1592,9 +1775,9 @@ def load_checkpoint_in_model(
                         if proceed:
                             new_dtype = torch.float32
 
-                if "weight" in param_name and param_name.replace("weight", "SCB") in checkpoint.keys():
+                if "weight" in param_name and param_name.replace("weight", "SCB") in loaded_checkpoint.keys():
                     if param.dtype == torch.int8:
-                        fp16_statistics = checkpoint[param_name.replace("weight", "SCB")]
+                        fp16_statistics = loaded_checkpoint[param_name.replace("weight", "SCB")]
                 else:
                     fp16_statistics = None
 
@@ -1631,8 +1814,14 @@ def load_checkpoint_in_model(
                     )
 
         # Force Python to clean up.
-        del checkpoint
+        del loaded_checkpoint
         gc.collect()
+
+    if not strict and len(unexpected_keys) > 0:
+        logger.warning(
+            f"Some weights of the model checkpoint at {checkpoint} were not used when"
+            f" initializing {model.__class__.__name__}: {unexpected_keys}. This may or may not be an issue - make sure that the checkpoint does not have unnecessary parameters, or that the model definition correctly corresponds to the checkpoint."
+        )
 
     save_offload_index(offload_index, offload_folder)
 
@@ -1667,10 +1856,11 @@ def get_mixed_precision_context_manager(native_amp: bool = False, autocast_kwarg
         )
         if state.mixed_precision == "fp16":
             return torch.autocast(device_type=device_type, dtype=torch.float16, **autocast_kwargs)
-        elif state.mixed_precision == "bf16" and state.distributed_type in [
+        elif state.mixed_precision in ["bf16", "fp8"] and state.distributed_type in [
             DistributedType.NO,
             DistributedType.MULTI_CPU,
             DistributedType.MULTI_GPU,
+            DistributedType.MULTI_MLU,
             DistributedType.MULTI_NPU,
             DistributedType.MULTI_XPU,
             DistributedType.FSDP,

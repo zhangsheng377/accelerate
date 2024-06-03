@@ -80,12 +80,28 @@ def get_ccl_version():
     return importlib.metadata.version("oneccl_bind_pt")
 
 
+def is_pynvml_available():
+    return _is_package_available("pynvml")
+
+
+def is_pytest_available():
+    return _is_package_available("pytest")
+
+
 def is_msamp_available():
     return _is_package_available("msamp", "ms-amp")
 
 
+def is_schedulefree_available():
+    return _is_package_available("schedulefree")
+
+
 def is_transformer_engine_available():
     return _is_package_available("transformer_engine")
+
+
+def is_lomo_available():
+    return _is_package_available("lomo_optim")
 
 
 def is_fp8_available():
@@ -97,11 +113,16 @@ def is_cuda_available():
     Checks if `cuda` is available via an `nvml-based` check which won't trigger the drivers and leave cuda
     uninitialized.
     """
+    pytorch_nvml_based_cuda_check_previous_value = os.environ.get("PYTORCH_NVML_BASED_CUDA_CHECK")
     try:
         os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = str(1)
         available = torch.cuda.is_available()
     finally:
-        os.environ.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+        if pytorch_nvml_based_cuda_check_previous_value:
+            os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = pytorch_nvml_based_cuda_check_previous_value
+        else:
+            os.environ.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+
     return available
 
 
@@ -146,6 +167,8 @@ def is_torch_xla_available(check_is_tpu=False, check_is_gpu=False):
 
 
 def is_deepspeed_available():
+    if is_mlu_available():
+        return _is_package_available("deepspeed", metadata_name="deepspeed-mlu")
     return _is_package_available("deepspeed")
 
 
@@ -163,6 +186,8 @@ def is_bf16_available(ignore_tpu=False):
         return not ignore_tpu
     if is_cuda_available():
         return torch.cuda.is_bf16_supported()
+    if is_mps_available():
+        return False
     return True
 
 
@@ -184,6 +209,10 @@ def is_8bit_bnb_available():
 
 def is_bnb_available():
     return _is_package_available("bitsandbytes")
+
+
+def is_torchvision_available():
+    return _is_package_available("torchvision")
 
 
 def is_megatron_lm_available():
@@ -273,8 +302,10 @@ def is_mlflow_available():
     return False
 
 
-def is_mps_available():
-    return is_torch_version(">=", "1.12") and torch.backends.mps.is_available() and torch.backends.mps.is_built()
+def is_mps_available(min_version="1.12"):
+    # With torch 1.12, you can use torch.backends.mps
+    # With torch 2.0.0, you can use torch.mps
+    return is_torch_version(">=", min_version) and torch.backends.mps.is_available() and torch.backends.mps.is_built()
 
 
 def is_ipex_available():
@@ -298,6 +329,25 @@ def is_ipex_available():
         )
         return False
     return True
+
+
+@lru_cache
+def is_mlu_available(check_device=False):
+    "Checks if `torch_mlu` is installed and potentially if a MLU is in the environment"
+    if importlib.util.find_spec("torch_mlu") is None:
+        return False
+
+    import torch
+    import torch_mlu  # noqa: F401
+
+    if check_device:
+        try:
+            # Will raise a RuntimeError if no MLU is found
+            _ = torch.mlu.device_count()
+            return torch.mlu.is_available()
+        except RuntimeError:
+            return False
+    return hasattr(torch, "mlu") and torch.mlu.is_available()
 
 
 @lru_cache

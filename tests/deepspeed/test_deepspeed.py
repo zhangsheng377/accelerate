@@ -36,6 +36,7 @@ from accelerate.test_utils.testing import (
     execute_subprocess_async,
     path_in_accelerate_package,
     require_deepspeed,
+    require_huggingface_suite,
     require_multi_device,
     require_non_cpu,
     slow,
@@ -50,12 +51,14 @@ from accelerate.utils.deepspeed import (
     DummyScheduler,
 )
 from accelerate.utils.other import patch_environment
+from accelerate.utils.versions import compare_versions
 
 
 set_seed(42)
 
 GPT2_TINY = "sshleifer/tiny-gpt2"
 MOBILEVIT = "apple/mobilevit-xx-small"
+QWEN_MOE = "peft-internal-testing/tiny-random-qwen-1.5-MoE"
 
 ZERO2 = "zero2"
 ZERO3 = "zero3"
@@ -354,10 +357,10 @@ class DeepSpeedConfigIntegration(AccelerateTestCase):
                 )
                 assert accelerator.deepspeed_config["zero_allow_untested_optimizer"]
                 assert accelerator.deepspeed_config["train_batch_size"], 16
-                assert type(model) == DeepSpeedEngine
-                assert type(optimizer) == DeepSpeedOptimizerWrapper
-                assert type(lr_scheduler) == AcceleratedScheduler
-                assert type(accelerator.deepspeed_engine_wrapped) == DeepSpeedEngineWrapper
+                assert type(model) is DeepSpeedEngine
+                assert type(optimizer) is DeepSpeedOptimizerWrapper
+                assert type(lr_scheduler) is AcceleratedScheduler
+                assert type(accelerator.deepspeed_engine_wrapped) is DeepSpeedEngineWrapper
 
         elif optim_type == DS_OPTIMIZER and scheduler_type == DS_SCHEDULER:
             # Test DeepSpeed optimizer + DeepSpeed scheduler
@@ -411,10 +414,10 @@ class DeepSpeedConfigIntegration(AccelerateTestCase):
                 model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
                     model, dummy_optimizer, train_dataloader, eval_dataloader, dummy_lr_scheduler
                 )
-                assert type(model) == DeepSpeedEngine
-                assert type(optimizer) == DeepSpeedOptimizerWrapper
-                assert type(lr_scheduler) == DeepSpeedSchedulerWrapper
-                assert type(accelerator.deepspeed_engine_wrapped) == DeepSpeedEngineWrapper
+                assert type(model) is DeepSpeedEngine
+                assert type(optimizer) is DeepSpeedOptimizerWrapper
+                assert type(lr_scheduler) is DeepSpeedSchedulerWrapper
+                assert type(accelerator.deepspeed_engine_wrapped) is DeepSpeedEngineWrapper
 
         elif optim_type == CUSTOM_OPTIMIZER and scheduler_type == DS_SCHEDULER:
             # Test custom optimizer + DeepSpeed scheduler
@@ -445,11 +448,11 @@ class DeepSpeedConfigIntegration(AccelerateTestCase):
                 model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
                     model, optimizer, train_dataloader, eval_dataloader, dummy_lr_scheduler
                 )
-                assert type(model) == DeepSpeedEngine
-                assert type(optimizer) == DeepSpeedOptimizerWrapper
-                assert type(lr_scheduler) == DeepSpeedSchedulerWrapper
-                assert type(accelerator.deepspeed_engine_wrapped) == DeepSpeedEngineWrapper
-        elif optim_type == DS_OPTIMIZER and scheduler_type == CUSTOM_SCHEDULER:
+                assert type(model) is DeepSpeedEngine
+                assert type(optimizer) is DeepSpeedOptimizerWrapper
+                assert type(lr_scheduler) is DeepSpeedSchedulerWrapper
+                assert type(accelerator.deepspeed_engine_wrapped) is DeepSpeedEngineWrapper
+        elif optim_type == DS_OPTIMIZER and scheduler_type is CUSTOM_SCHEDULER:
             # Test deepspeed optimizer + custom scheduler
             deepspeed_plugin = DeepSpeedPlugin(hf_ds_config=self.ds_config_file[ZERO2])
             with mockenv_context(**self.dist_env):
@@ -651,7 +654,6 @@ class DeepSpeedConfigIntegration(AccelerateTestCase):
         del deepspeed_plugin.deepspeed_config["scheduler"]
         with mockenv_context(**self.dist_env):
             accelerator = Accelerator(mixed_precision="fp16", deepspeed_plugin=deepspeed_plugin)
-
             train_set = RegressionDataset(length=80)
             eval_set = RegressionDataset(length=20)
             train_dataloader = DataLoader(train_set, batch_size=16, shuffle=True)
@@ -811,6 +813,30 @@ class DeepSpeedConfigIntegration(AccelerateTestCase):
         )
         assert deepspeed_plugin.zero_stage == int(stage.replace("zero", ""))
 
+    def test_prepare_deepspeed_prepare_moe(self):
+        if compare_versions("transformers", "<", "4.40") and compare_versions("deepspeed", "<", "0.14"):
+            return
+        deepspeed_plugin = DeepSpeedPlugin(
+            zero3_init_flag=True,
+            gradient_accumulation_steps=1,
+            gradient_clipping=1.0,
+            zero_stage=3,
+            offload_optimizer_device="none",
+            offload_param_device="none",
+            zero3_save_16bit_model=True,
+            transformer_moe_cls_names="Qwen2MoeSparseMoeBlock",
+        )
+        with mockenv_context(**self.dist_env):
+            accelerator = Accelerator(mixed_precision="fp16", deepspeed_plugin=deepspeed_plugin)
+            accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = 1
+            model = AutoModelForCausalLM.from_pretrained(QWEN_MOE)
+            model = accelerator.prepare(model)
+            from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeSparseMoeBlock
+
+            for module in model.modules():
+                if isinstance(module, Qwen2MoeSparseMoeBlock):
+                    assert hasattr(module, "_z3_leaf") and module._z3_leaf
+
     def test_basic_run(self):
         test_file_path = path_in_accelerate_package("test_utils", "scripts", "external_deps", "test_performance.py")
         with tempfile.TemporaryDirectory() as dirpath:
@@ -832,7 +858,7 @@ class DeepSpeedConfigIntegration(AccelerateTestCase):
                 f"--output_dir={dirpath}",
             ]
             with patch_environment(omp_num_threads=1):
-                execute_subprocess_async(cmd, env=os.environ.copy())
+                execute_subprocess_async(cmd)
 
 
 @require_deepspeed
@@ -909,7 +935,7 @@ class DeepSpeedIntegrationTest(TempDirTestCase):
                 ]
             )
             with patch_environment(omp_num_threads=1):
-                execute_subprocess_async(cmd_stage, env=os.environ.copy())
+                execute_subprocess_async(cmd_stage)
 
     def test_checkpointing(self):
         self.test_file_path = self.test_scripts_folder / "test_checkpointing.py"
@@ -953,7 +979,7 @@ class DeepSpeedIntegrationTest(TempDirTestCase):
                 ]
             )
             with patch_environment(omp_num_threads=1):
-                execute_subprocess_async(cmd_stage, env=os.environ.copy())
+                execute_subprocess_async(cmd_stage)
 
             cmd_stage = cmd_stage[:-1]
             resume_from_checkpoint = os.path.join(self.tmpdir, "epoch_0")
@@ -963,9 +989,14 @@ class DeepSpeedIntegrationTest(TempDirTestCase):
                 ]
             )
             with patch_environment(omp_num_threads=1):
-                execute_subprocess_async(cmd_stage, env=os.environ.copy())
+                execute_subprocess_async(cmd_stage)
 
     def test_peak_memory_usage(self):
+        if compare_versions("deepspeed", ">", "0.12.6"):
+            self.skipTest(
+                "The test fails when deepspeed>0.12.6. This is something that needs to be fixed on deepspeed library"
+            )
+
         self.test_file_path = self.test_scripts_folder / "test_peak_memory_usage.py"
         cmd = [
             "accelerate",
@@ -992,8 +1023,8 @@ class DeepSpeedIntegrationTest(TempDirTestCase):
                     ]
                 )
                 for i in range(3):
-                    if f"stage_{i+1}" in spec:
-                        cmd_stage.extend([f"--zero_stage={i+1}"])
+                    if f"stage_{i + 1}" in spec:
+                        cmd_stage.extend([f"--zero_stage={i + 1}"])
                         break
                 cmd_stage.extend(
                     [
@@ -1026,7 +1057,7 @@ class DeepSpeedIntegrationTest(TempDirTestCase):
                 ]
             )
             with patch_environment(omp_num_threads=1):
-                execute_subprocess_async(cmd_stage, env=os.environ.copy())
+                execute_subprocess_async(cmd_stage)
 
     def test_lr_scheduler(self):
         self.test_file_path = self.test_scripts_folder / "test_performance.py"
@@ -1050,4 +1081,11 @@ class DeepSpeedIntegrationTest(TempDirTestCase):
             f"--performance_lower_bound={self.performance_lower_bound}",
         ]
         with patch_environment(omp_num_threads=1):
-            execute_subprocess_async(cmd, env=os.environ.copy())
+            execute_subprocess_async(cmd)
+
+    @require_huggingface_suite
+    def test_zero3_integration(self):
+        self.test_file_path = self.test_scripts_folder / "test_zero3_integration.py"
+        cmd = ["accelerate", "launch", "--num_processes=2", "--num_machines=1", self.test_file_path]
+        with patch_environment(omp_num_threads=1):
+            execute_subprocess_async(cmd)

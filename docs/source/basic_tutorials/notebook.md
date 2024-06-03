@@ -430,6 +430,17 @@ args = (model, "fp16", 42, 64)
 notebook_launcher(training_loop, args, num_processes=8)
 ```
 
+To launch the training process with elasticity, enabling fault tolerance, you can use the `elastic_launch` feature provided by PyTorch. This requires setting additional parameters such as `rdzv_backend` and `max_restarts`. Here is an example of how to use `notebook_launcher` with elastic capabilities:
+
+```python
+notebook_launcher(
+    training_loop,
+    args,
+    num_processes=2,
+    max_restarts=3
+)
+```
+
 As it's running it will print the progress as well as state how many devices you ran on. This tutorial was ran with two GPUs:
 
 ```python out
@@ -442,6 +453,12 @@ epoch 4: 94.71
 ```
 
 And that's it!
+
+Please note that [`notebook_launcher`] ignores the 🤗 Accelerate config file, to launch based on the config use:
+
+```bash
+accelerate launch
+```
 
 ## Debugging 
 

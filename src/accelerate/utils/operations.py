@@ -97,7 +97,7 @@ def recursively_apply(func, data, *args, test_type=is_torch_tensor, error_on_oth
         error_on_other_type (`bool`, *optional*, defaults to `False`):
             Whether to return an error or not if after unpacking `data`, we get on an object that is not of type
             `main_type`. If `False`, the function will leave objects of types different than `main_type` unchanged.
-        **kwargs:
+        **kwargs (additional keyword arguments, *optional*):
             Keyword arguments that will be passed to `func` when applied on the unpacked data.
 
     Returns:
@@ -145,7 +145,35 @@ def send_to_device(tensor, device, non_blocking=False, skip_keys=None):
     Returns:
         The same data structure as `tensor` with all tensors sent to the proper device.
     """
-    if isinstance(tensor, (tuple, list)):
+    if is_torch_tensor(tensor) or hasattr(tensor, "to"):
+        # `torch.Tensor.to("npu")` could not find context when called for the first time (see this [issue](https://gitee.com/ascend/pytorch/issues/I8KECW?from=project-issue)).
+        if device == "npu":
+            device = "npu:0"
+        if device == "xpu":
+            device = "xpu:0"
+        # TODO: torch_mlu LongTensor.to(<int num>) has bugs, we will fix this later.
+        if is_torch_tensor(tensor) and tensor.device.type in ["mlu"] and tensor.dtype in [torch.int64]:
+            tensor = tensor.cpu()
+        try:
+            return tensor.to(device, non_blocking=non_blocking)
+        except TypeError:  # .to() doesn't accept non_blocking as kwarg
+            return tensor.to(device)
+        except AssertionError as error:
+            # `torch.Tensor.to(<int num>)` is not supported by `torch_npu` (see this [issue](https://github.com/Ascend/pytorch/issues/16)).
+            # This call is inside the try-block since is_npu_available is not supported by torch.compile.
+            if is_npu_available():
+                if isinstance(device, int):
+                    device = f"npu:{device}"
+            elif is_xpu_available():
+                if isinstance(device, int):
+                    device = f"xpu:{device}"
+            else:
+                raise error
+        try:
+            return tensor.to(device, non_blocking=non_blocking)
+        except TypeError:  # .to() doesn't accept non_blocking as kwarg
+            return tensor.to(device)
+    elif isinstance(tensor, (tuple, list)):
         return honor_type(
             tensor, (send_to_device(t, device, non_blocking=non_blocking, skip_keys=skip_keys) for t in tensor)
         )
@@ -160,34 +188,6 @@ def send_to_device(tensor, device, non_blocking=False, skip_keys=None):
                 for k, t in tensor.items()
             }
         )
-    elif is_torch_tensor(tensor) or hasattr(tensor, "to"):
-        # `torch.Tensor.to("npu")` could not find context when called for the first time (see this [issue](https://gitee.com/ascend/pytorch/issues/I8KECW?from=project-issue)).
-        if device == "npu":
-            device = "npu:0"
-        if device == "xpu":
-            device = "xpu:0"
-        try:
-            return tensor.to(device, non_blocking=non_blocking)
-        except TypeError:  # .to() doesn't accept non_blocking as kwarg
-            return tensor.to(device)
-        except AssertionError as error:
-            # `torch.Tensor.to(<int num>)` is not supported by `torch_npu` (see this [issue](https://github.com/Ascend/pytorch/issues/16)).
-            # This call is inside the try-block since is_npu_available is not supported by torch.compile.
-            if is_npu_available():
-                if isinstance(device, int):
-                    device = f"npu:{device}"
-            else:
-                raise error
-        except Exception as error:
-            if is_xpu_available():
-                if isinstance(device, int):
-                    device = f"xpu:{device}"
-            else:
-                raise error
-        try:
-            return tensor.to(device, non_blocking=non_blocking)
-        except TypeError:  # .to() doesn't accept non_blocking as kwarg
-            return tensor.to(device)
     else:
         return tensor
 

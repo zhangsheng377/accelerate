@@ -22,7 +22,7 @@ import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs, GradScalerKwargs
 from accelerate.state import AcceleratorState
 from accelerate.test_utils import (
-    device_count,
+    DEFAULT_LAUNCH_COMMAND,
     execute_subprocess_async,
     require_multi_device,
     require_non_cpu,
@@ -68,8 +68,8 @@ class KwargsHandlerTester(unittest.TestCase):
 
     @require_multi_device
     def test_ddp_kwargs(self):
-        cmd = ["torchrun", f"--nproc_per_node={device_count}", inspect.getfile(self.__class__)]
-        execute_subprocess_async(cmd, env=os.environ.copy())
+        cmd = DEFAULT_LAUNCH_COMMAND + [inspect.getfile(self.__class__)]
+        execute_subprocess_async(cmd)
 
     @require_non_cpu
     def test_autocast_kwargs(self):

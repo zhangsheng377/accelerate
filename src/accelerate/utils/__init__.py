@@ -1,3 +1,16 @@
+# Copyright 2022 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from .constants import (
     MODEL_NAME,
     OPTIMIZER_NAME,
@@ -43,9 +56,13 @@ from .environment import (
     are_libraries_initialized,
     check_cuda_p2p_ib_support,
     check_fp8_capability,
+    convert_dict_to_env_variables,
+    get_cpu_distributed_information,
+    get_gpu_info,
     get_int_from_env,
     parse_choice_from_env,
     parse_flag_from_env,
+    set_numa_affinity,
     str_to_bool,
 )
 from .imports import (
@@ -65,19 +82,25 @@ from .imports import (
     is_dvclive_available,
     is_fp8_available,
     is_ipex_available,
+    is_lomo_available,
     is_megatron_lm_available,
     is_mlflow_available,
+    is_mlu_available,
     is_mps_available,
     is_msamp_available,
     is_npu_available,
     is_pandas_available,
     is_peft_available,
     is_pippy_available,
+    is_pynvml_available,
+    is_pytest_available,
     is_rich_available,
     is_sagemaker_available,
+    is_schedulefree_available,
     is_tensorboard_available,
     is_timm_available,
     is_torch_xla_available,
+    is_torchvision_available,
     is_transformer_engine_available,
     is_transformers_available,
     is_wandb_available,
@@ -157,7 +180,7 @@ if is_deepspeed_available():
     )
 
 from .bnb import has_4bit_bnb_layers, load_and_quantize_model
-from .fsdp_utils import load_fsdp_model, load_fsdp_optimizer, save_fsdp_model, save_fsdp_optimizer
+from .fsdp_utils import load_fsdp_model, load_fsdp_optimizer, merge_fsdp_weights, save_fsdp_model, save_fsdp_optimizer
 from .launch import (
     PrepareForLaunch,
     _filter_args,

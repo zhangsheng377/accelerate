@@ -26,8 +26,11 @@ import torch
 from accelerate.test_utils.examples import compare_against_test
 from accelerate.test_utils.testing import (
     TempDirTestCase,
+    get_launch_command,
+    require_huggingface_suite,
     require_multi_gpu,
     require_pippy,
+    require_schedulefree,
     require_trackers,
     run_command,
     slow,
@@ -45,6 +48,7 @@ EXCLUDE_EXAMPLES = [
     "local_sgd.py",
     "multi_process_metrics.py",
     "memory.py",
+    "schedule_free.py",
     "automatic_gradient_accumulation.py",
     "fsdp_with_peak_mem_tracking.py",
     "deepspeed_with_config_support.py",
@@ -135,6 +139,7 @@ class ExampleDifferenceTests(unittest.TestCase):
 
 
 @mock.patch.dict(os.environ, {"TESTING_MOCKED_DATALOADERS": "1"})
+@require_huggingface_suite
 class FeatureExamplesTests(TempDirTestCase):
     clear_on_setup = False
 
@@ -142,10 +147,10 @@ class FeatureExamplesTests(TempDirTestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls._tmpdir = tempfile.mkdtemp()
-        cls.configPath = Path(cls._tmpdir) / "default_config.yml"
+        cls.config_file = Path(cls._tmpdir) / "default_config.yml"
 
-        write_basic_config(save_location=cls.configPath)
-        cls._launch_args = ["accelerate", "launch", "--config_file", cls.configPath]
+        write_basic_config(save_location=cls.config_file)
+        cls.launch_args = get_launch_command(config_file=cls.config_file)
 
     @classmethod
     def tearDownClass(cls):
@@ -158,7 +163,7 @@ class FeatureExamplesTests(TempDirTestCase):
         --checkpointing_steps epoch
         --output_dir {self.tmpdir}
         """.split()
-        run_command(self._launch_args + testargs)
+        run_command(self.launch_args + testargs)
         assert (self.tmpdir / "epoch_0").exists()
 
     def test_checkpointing_by_steps(self):
@@ -167,7 +172,7 @@ class FeatureExamplesTests(TempDirTestCase):
         --checkpointing_steps 1
         --output_dir {self.tmpdir}
         """.split()
-        _ = run_command(self._launch_args + testargs)
+        _ = run_command(self.launch_args + testargs)
         assert (self.tmpdir / "step_2").exists()
 
     def test_load_states_by_epoch(self):
@@ -175,7 +180,7 @@ class FeatureExamplesTests(TempDirTestCase):
         examples/by_feature/checkpointing.py
         --resume_from_checkpoint {self.tmpdir / "epoch_0"}
         """.split()
-        output = run_command(self._launch_args + testargs, return_stdout=True)
+        output = run_command(self.launch_args + testargs, return_stdout=True)
         assert "epoch 0:" not in output
         assert "epoch 1:" in output
 
@@ -184,7 +189,7 @@ class FeatureExamplesTests(TempDirTestCase):
         examples/by_feature/checkpointing.py
         --resume_from_checkpoint {self.tmpdir / "step_2"}
         """.split()
-        output = run_command(self._launch_args + testargs, return_stdout=True)
+        output = run_command(self.launch_args + testargs, return_stdout=True)
         if torch.cuda.is_available():
             num_processes = torch.cuda.device_count()
         else:
@@ -203,7 +208,7 @@ class FeatureExamplesTests(TempDirTestCase):
         --num_folds 2
         """.split()
         with mock.patch.dict(os.environ, {"TESTING_MOCKED_DATALOADERS": "0"}):
-            output = run_command(self._launch_args + testargs, return_stdout=True)
+            output = run_command(self.launch_args + testargs, return_stdout=True)
             results = re.findall("({.+})", output)
             results = [r for r in results if "accuracy" in r][-1]
             results = ast.literal_eval(results)
@@ -211,7 +216,12 @@ class FeatureExamplesTests(TempDirTestCase):
 
     def test_multi_process_metrics(self):
         testargs = ["examples/by_feature/multi_process_metrics.py"]
-        run_command(self._launch_args + testargs)
+        run_command(self.launch_args + testargs)
+
+    @require_schedulefree
+    def test_schedulefree(self):
+        testargs = ["examples/by_feature/schedule_free.py"]
+        run_command(self.launch_args + testargs)
 
     @require_trackers
     @mock.patch.dict(os.environ, {"WANDB_MODE": "offline", "DVCLIVE_TEST": "true"})
@@ -222,42 +232,45 @@ class FeatureExamplesTests(TempDirTestCase):
             --with_tracking
             --project_dir {tmpdir}
             """.split()
-            run_command(self._launch_args + testargs)
+            run_command(self.launch_args + testargs)
             assert os.path.exists(os.path.join(tmpdir, "tracking"))
 
     def test_gradient_accumulation(self):
         testargs = ["examples/by_feature/gradient_accumulation.py"]
-        run_command(self._launch_args + testargs)
+        run_command(self.launch_args + testargs)
 
     def test_local_sgd(self):
         testargs = ["examples/by_feature/local_sgd.py"]
-        run_command(self._launch_args + testargs)
+        run_command(self.launch_args + testargs)
 
     def test_early_stopping(self):
         testargs = ["examples/by_feature/early_stopping.py"]
-        run_command(self._launch_args + testargs)
+        run_command(self.launch_args + testargs)
+
+    @require_multi_gpu
+    def test_distributed_inference_examples_stable_diffusion(self):
+        testargs = ["examples/inference/distributed/stable_diffusion.py"]
+        run_command(self.launch_args + testargs)
+
+    @require_multi_gpu
+    def test_distributed_inference_examples_phi2(self):
+        testargs = ["examples/inference/distributed/phi2.py"]
+        run_command(self.launch_args + testargs)
 
     @require_pippy
     @require_multi_gpu
     def test_pippy_examples_bert(self):
-        testargs = ["examples/inference/bert.py"]
-        run_command(self._launch_args + testargs)
+        testargs = ["examples/inference/pippy/bert.py"]
+        run_command(self.launch_args + testargs)
 
     @require_pippy
     @require_multi_gpu
     def test_pippy_examples_gpt2(self):
-        testargs = ["examples/inference/gpt2.py"]
-        run_command(self._launch_args + testargs)
+        testargs = ["examples/inference/pippy/gpt2.py"]
+        run_command(self.launch_args + testargs)
 
     @require_pippy
     @require_multi_gpu
     def test_pippy_examples_t5(self):
-        testargs = ["examples/inference/t5.py"]
-        run_command(self._launch_args + testargs)
-
-    @slow
-    @require_pippy
-    @require_multi_gpu
-    def test_pippy_examples_llama(self):
-        testargs = ["examples/inference/llama.py"]
-        run_command(self._launch_args + testargs)
+        testargs = ["examples/inference/pippy/t5.py"]
+        run_command(self.launch_args + testargs)

@@ -40,14 +40,17 @@ from ..utils import (
     is_datasets_available,
     is_deepspeed_available,
     is_dvclive_available,
+    is_mlu_available,
     is_mps_available,
     is_npu_available,
     is_pandas_available,
     is_pippy_available,
+    is_schedulefree_available,
     is_tensorboard_available,
     is_timm_available,
     is_torch_version,
     is_torch_xla_available,
+    is_torchvision_available,
     is_transformers_available,
     is_wandb_available,
     is_xpu_available,
@@ -60,8 +63,12 @@ def get_backend():
         return "xla", torch.cuda.device_count(), torch.cuda.memory_allocated
     elif is_cuda_available():
         return "cuda", torch.cuda.device_count(), torch.cuda.memory_allocated
-    elif is_mps_available():
+    elif is_mps_available(min_version="2.0"):
         return "mps", 1, torch.mps.current_allocated_memory()
+    elif is_mps_available():
+        return "mps", 1, 0
+    elif is_mlu_available():
+        return "mlu", torch.mlu.device_count(), torch.mlu.memory_allocated
     elif is_npu_available():
         return "npu", torch.npu.device_count(), torch.npu.memory_allocated
     elif is_xpu_available():
@@ -71,6 +78,28 @@ def get_backend():
 
 
 torch_device, device_count, memory_allocated_func = get_backend()
+
+
+def get_launch_command(**kwargs) -> list:
+    """
+    Wraps around `kwargs` to help simplify launching from `subprocess`.
+
+    Example:
+    ```python
+    # returns ['accelerate', 'launch', '--num_processes=2', '--device_count=2']
+    get_launch_command(num_processes=2, device_count=2)
+    ```
+    """
+    command = ["accelerate", "launch"]
+    for k, v in kwargs.items():
+        if isinstance(v, bool) and v:
+            command.append(f"--{k}")
+        elif v is not None:
+            command.append(f"--{k}={v}")
+    return command
+
+
+DEFAULT_LAUNCH_COMMAND = get_launch_command(num_processes=device_count)
 
 
 def parse_flag_from_env(key, default=False):
@@ -142,6 +171,13 @@ def require_non_xpu(test_case):
     return unittest.skipUnless(torch_device != "xpu", "test requires a non-XPU")(test_case)
 
 
+def require_mlu(test_case):
+    """
+    Decorator marking a test that requires MLU. These tests are skipped when there are no MLU available.
+    """
+    return unittest.skipUnless(is_mlu_available(), "test require a MLU")(test_case)
+
+
 def require_npu(test_case):
     """
     Decorator marking a test that requires NPU. These tests are skipped when there are no NPU available.
@@ -162,7 +198,8 @@ def require_huggingface_suite(test_case):
     Decorator marking a test that requires transformers and datasets. These tests are skipped when they are not.
     """
     return unittest.skipUnless(
-        is_transformers_available() and is_datasets_available(), "test requires the Hugging Face suite"
+        is_transformers_available() and is_datasets_available(),
+        "test requires the Hugging Face suite",
     )(test_case)
 
 
@@ -178,6 +215,20 @@ def require_timm(test_case):
     Decorator marking a test that requires transformers. These tests are skipped when they are not.
     """
     return unittest.skipUnless(is_timm_available(), "test requires the timm library")(test_case)
+
+
+def require_torchvision(test_case):
+    """
+    Decorator marking a test that requires torchvision. These tests are skipped when they are not.
+    """
+    return unittest.skipUnless(is_torchvision_available(), "test requires the torchvision library")(test_case)
+
+
+def require_schedulefree(test_case):
+    """
+    Decorator marking a test that requires schedulefree. These tests are skipped when they are not.
+    """
+    return unittest.skipUnless(is_schedulefree_available(), "test requires the schedulefree library")(test_case)
 
 
 def require_bnb(test_case):

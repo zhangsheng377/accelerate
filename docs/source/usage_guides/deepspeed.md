@@ -9,7 +9,7 @@ Unless required by applicable law or agreed to in writing, software distributed 
 an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
 
-⚠️ Note that this file is in Markdown but contain specific syntax for our doc-builder (similar to MDX) that may not be
+⚠️ Note that this file is in Markdown but contains specific syntax for our doc-builder (similar to MDX) that may not be
 rendered properly in your Markdown viewer.
 -->
 
@@ -157,10 +157,18 @@ Currently, `Accelerate` supports following config through the CLI:
 `gradient_accumulation_steps`: Number of training steps to accumulate gradients before averaging and applying them.
 `gradient_clipping`: Enable gradient clipping with value.
 `offload_optimizer_device`: [none] Disable optimizer offloading, [cpu] offload optimizer to CPU, [nvme] offload optimizer to NVMe SSD. Only applicable with ZeRO >= Stage-2.
+`offload_optimizer_nvme_path`: Decides Nvme Path to offload optimizer states. If unspecified, will default to 'none'.
 `offload_param_device`: [none] Disable parameter offloading, [cpu] offload parameters to CPU, [nvme] offload parameters to NVMe SSD. Only applicable with ZeRO Stage-3.
+`offload_param_nvme_path`: Decides Nvme Path to offload parameters. If unspecified, will default to 'none'.
 `zero3_init_flag`: Decides whether to enable `deepspeed.zero.Init` for constructing massive models. Only applicable with ZeRO Stage-3.
 `zero3_save_16bit_model`: Decides whether to save 16-bit model weights when using ZeRO Stage-3.
 `mixed_precision`: `no` for FP32 training, `fp16` for FP16 mixed-precision training and `bf16` for BF16 mixed-precision training.
+`deepspeed_moe_layer_cls_names`: Comma-separated list of transformer Mixture-of-Experts (MoE) layer class names (case-sensitive) to wrap ,e.g, `MixtralSparseMoeBlock`, `Qwen2MoeSparseMoeBlock`, `JetMoEAttention,JetMoEBlock` ...
+`deepspeed_hostfile`: DeepSpeed hostfile for configuring multi-node compute resources.
+`deepspeed_exclusion_filter`: DeepSpeed exclusion filter string when using mutli-node setup.
+`deepspeed_inclusion_filter`: DeepSpeed inclusion filter string when using mutli-node setup.
+`deepspeed_multinode_launcher`: DeepSpeed multi-node launcher to use. If unspecified, will default to `pdsh`.
+`deepspeed_config_file`: path to the DeepSpeed config file in `json` format. See the next section for more details on this.
 ```
 To be able to tweak more options, you will need to use a DeepSpeed config file.
 
@@ -353,7 +361,7 @@ accelerate launch examples/by_feature/deepspeed_with_config_support.py \
 ```
 
 **ZeRO++ Config Example**
-You can use the the features of ZeRO++ by using the appropriate config parameters. Note that ZeRO++ is an extension for ZeRO Stage 3. Here is how the config file can be modified, from [DeepSpeed's ZeRO++ tutorial](https://www.deepspeed.ai/tutorials/zeropp/):
+You can use the features of ZeRO++ by using the appropriate config parameters. Note that ZeRO++ is an extension for ZeRO Stage 3. Here is how the config file can be modified, from [DeepSpeed's ZeRO++ tutorial](https://www.deepspeed.ai/tutorials/zeropp/):
 
 ```json
 {
@@ -519,7 +527,7 @@ ValueError: When using `deepspeed_config_file`, the following accelerate config 
 ['gradient_accumulation_steps', 'gradient_clipping', 'zero_stage', 'offload_optimizer_device', 'offload_param_device',
 'zero3_save_16bit_model', 'mixed_precision'].
 Please specify them appropriately in the DeepSpeed config file.
-If you are using an accelerate config file, remove others config variables mentioned in the above specified list.
+If you are using an accelerate config file, remove other config variables mentioned in the above specified list.
 The easiest method is to create a new config following the questionnaire via `accelerate config`.
 It will only ask for the necessary config variables when using `deepspeed_config_file`.
 ```
@@ -721,3 +729,10 @@ Papers:
 
 Finally, please, remember that 🤗 `Accelerate` only integrates DeepSpeed, therefore if you
 have any problems or questions with regards to DeepSpeed usage, please, file an issue with [DeepSpeed GitHub](https://github.com/microsoft/DeepSpeed/issues).
+
+
+<Tip>
+
+    For those interested in the similarities and differences between FSDP and DeepSpeed, please check out the [concept guide here](../concept_guides/fsdp_and_deepspeed.md)!
+    
+</Tip>

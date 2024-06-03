@@ -28,6 +28,7 @@ import torch
 from accelerate.commands.config import default_config_file, load_config_from_file
 from accelerate.commands.config.config_args import SageMakerConfig
 from accelerate.commands.config.config_utils import DYNAMO_BACKENDS
+from accelerate.commands.utils import CustomArgumentParser
 from accelerate.state import get_int_from_env
 from accelerate.utils import (
     ComputeEnvironment,
@@ -35,8 +36,10 @@ from accelerate.utils import (
     PrepareForLaunch,
     _filter_args,
     check_cuda_p2p_ib_support,
+    convert_dict_to_env_variables,
     is_bf16_available,
     is_deepspeed_available,
+    is_mlu_available,
     is_npu_available,
     is_rich_available,
     is_sagemaker_available,
@@ -63,80 +66,93 @@ if is_rich_available():
 
 logger = logging.getLogger(__name__)
 
+
 options_to_group = {
-    "--multi-gpu": "Distributed GPUs",
-    "--tpu": "TPU",
-    "--use_deepspeed": "DeepSpeed Arguments",
-    "--use_fsdp": "FSDP Arguments",
-    "--use_megatron_lm": "Megatron-LM Arguments",
+    "multi_gpu": "Distributed GPUs",
+    "tpu": "TPU",
+    "use_deepspeed": "DeepSpeed Arguments",
+    "use_fsdp": "FSDP Arguments",
+    "use_megatron_lm": "Megatron-LM Arguments",
 }
 
 
 def clean_option(option):
     "Finds all cases of - after the first two characters and changes them to _"
     if option.startswith("--"):
-        return option[:3] + option[3:].replace("-", "_")
+        return option[2:].replace("-", "_")
 
 
-class _CustomHelpAction(argparse._HelpAction):
+class CustomHelpFormatter(argparse.HelpFormatter):
     """
-    This is a custom help action that will hide all arguments that are not used in the command line when the help is
+    This is a custom help formatter that will hide all arguments that are not used in the command line when the help is
     called. This is useful for the case where the user is using a specific platform and only wants to see the arguments
     for that platform.
     """
 
-    def __call__(self, parser, namespace, values, option_string=None):
-        if "accelerate" in sys.argv[0] and "launch" in sys.argv[1:]:
-            args = sys.argv[2:]
-        else:
-            args = sys.argv[1:]
-        opts = parser._actions
-        titles = [
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.titles = [
             "Hardware Selection Arguments",
             "Resource Selection Arguments",
             "Training Paradigm Arguments",
             "positional arguments",
             "optional arguments",
         ]
-        if len(args) > 1:
-            used_platforms = [arg for arg in args if arg in options_to_group.keys()]
-            args = list(map(clean_option, args))
-            used_titles = [options_to_group[o] for o in used_platforms]
-            for i, arg in enumerate(opts):
-                # If the argument's container is outside of the used titles, hide it
-                if arg.container.title not in titles + used_titles:
-                    opts[i].help = argparse.SUPPRESS
-                # If the argument is hardware selection, but not being passed, hide it
-                elif arg.container.title == "Hardware Selection Arguments":
-                    if set(arg.option_strings).isdisjoint(set(args)):
-                        opts[i].help = argparse.SUPPRESS
-                    else:
-                        opts[i].help = arg.help + " (currently selected)"
-                # If the argument is a training paradigm, but not being passed, hide it
-                elif arg.container.title == "Training Paradigm Arguments":
-                    if set(arg.option_strings).isdisjoint(set(used_platforms)):
-                        opts[i].help = argparse.SUPPRESS
-                    else:
-                        opts[i].help = arg.help + " (currently selected)"
-            for i, group in enumerate(list(parser._action_groups)):
-                # If all arguments in the group are hidden, hide the group
-                if all([arg.help == argparse.SUPPRESS for arg in group._group_actions]):
-                    parser._action_groups.remove(group)
 
-        super().__call__(parser, namespace, values, option_string)
+    def add_argument(self, action: argparse.Action):
+        if "accelerate" in sys.argv[0] and "launch" in sys.argv[1:]:
+            args = sys.argv[2:]
+        else:
+            args = sys.argv[1:]
+
+        if len(args) > 1:
+            args = list(map(clean_option, args))
+            used_platforms = [arg for arg in args if arg in options_to_group.keys()]
+            used_titles = [options_to_group[o] for o in used_platforms]
+            if action.container.title not in self.titles + used_titles:
+                action.help = argparse.SUPPRESS
+            elif action.container.title == "Hardware Selection Arguments":
+                if set(action.option_strings).isdisjoint(set(args)):
+                    action.help = argparse.SUPPRESS
+                else:
+                    action.help = action.help + " (currently selected)"
+            elif action.container.title == "Training Paradigm Arguments":
+                if set(action.option_strings).isdisjoint(set(args)):
+                    action.help = argparse.SUPPRESS
+                else:
+                    action.help = action.help + " (currently selected)"
+
+        action.option_strings = [s for s in action.option_strings if "-" not in s[2:]]
+        super().add_argument(action)
+
+    def end_section(self):
+        if len(self._current_section.items) < 2:
+            self._current_section.items = []
+            self._current_section.heading = ""
+        super().end_section()
 
 
 def launch_command_parser(subparsers=None):
+    description = "Launch a python script in a distributed scenario. Arguments can be passed in with either hyphens (`--num-processes=2`) or underscores (`--num_processes=2`)"
     if subparsers is not None:
-        parser = subparsers.add_parser("launch", add_help=False, allow_abbrev=False)
+        parser = subparsers.add_parser(
+            "launch", description=description, add_help=False, allow_abbrev=False, formatter_class=CustomHelpFormatter
+        )
     else:
-        parser = argparse.ArgumentParser("Accelerate launch command", add_help=False, allow_abbrev=False)
+        parser = CustomArgumentParser(
+            "Accelerate launch command",
+            description=description,
+            add_help=False,
+            allow_abbrev=False,
+            formatter_class=CustomHelpFormatter,
+        )
 
-    parser.register("action", "help", _CustomHelpAction)
     parser.add_argument("-h", "--help", action="help", help="Show this help message and exit.")
 
     parser.add_argument(
-        "--config_file", default=None, help="The config file to use for the default values in the launching script."
+        "--config_file",
+        default=None,
+        help="The config file to use for the default values in the launching script.",
     )
     parser.add_argument(
         "--quiet",
@@ -190,6 +206,12 @@ def launch_command_parser(subparsers=None):
         type=int,
         default=None,
         help="The number of CPU threads per process. Can be tuned for optimal performance.",
+    )
+    resource_args.add_argument(
+        "--enable_cpu_affinity",
+        default=False,
+        action="store_true",
+        help="Whether or not CPU affinity and balancing should be enabled. Currently only supported on NVIDIA hardware.",
     )
 
     # Dynamo arguments
@@ -280,6 +302,15 @@ def launch_command_parser(subparsers=None):
         default="0",
         type=str,
         help="Tee std streams into a log file and also to console.",
+    )
+    distributed_args.add_argument(
+        "--log_dir",
+        type=str,
+        default=None,
+        help=(
+            "Base directory to use for log files when using torchrun/torch.distributed.run as launcher. "
+            "Use with --tee to redirect std streams info log files."
+        ),
     )
     distributed_args.add_argument(
         "--role",
@@ -465,6 +496,13 @@ def launch_command_parser(subparsers=None):
         type=str,
         help="DeepSpeed multi-node launcher to use. If unspecified, will default to `pdsh`.",
     )
+    deepspeed_args.add_argument(
+        "--deepspeed_moe_layer_cls_names",
+        default=None,
+        type=str,
+        help="comma-separated list of transformer MoE layer class names (case-sensitive) to wrap ,e.g, `MixtralSparseMoeBlock`, `Qwen2MoeSparseMoeBlock`, `JetMoEAttention,JetMoEBlock` ..."
+        " (useful only when `use_deepspeed` flag is passed).",
+    )
 
     # fsdp arguments
     fsdp_args = parser.add_argument_group("FSDP Arguments", "Arguments related to Fully Shared Data Parallelism.")
@@ -546,6 +584,12 @@ def launch_command_parser(subparsers=None):
         help="If True, each individually wrapped FSDP unit will broadcast module parameters from rank 0."
         " (useful only when `use_fsdp` flag is passed).",
     )
+    fsdp_args.add_argument(
+        "--fsdp_activation_checkpointing",
+        default="false",
+        type=str,
+        help="Decides Whether (true|false) intermediate activations are freed during the forward pass, and a checkpoint is left as a placeholder. (useful only when `use_fsdp` flag is passed).",
+    )
 
     # megatron_lm args
     megatron_lm_args = parser.add_argument_group("Megatron-LM Arguments", "Arguments related to Megatron-LM.")
@@ -625,6 +669,22 @@ def launch_command_parser(subparsers=None):
         ),
     )
 
+    # MPI arguments
+    mpirun_args = parser.add_argument_group("MPI Arguments", "Arguments related to mpirun for Multi-CPU")
+    mpirun_args.add_argument(
+        "--mpirun_hostfile",
+        type=str,
+        default=None,
+        help="Location for a hostfile for using Accelerate to launch a multi-CPU training job with mpirun. This will "
+        "get passed to the MPI --hostfile or -f parameter, depending on which MPI program is installed.",
+    )
+    mpirun_args.add_argument(
+        "--mpirun_ccl",
+        type=int,
+        default=1,
+        help="The number of oneCCL worker threads when using Accelerate to launch multi-CPU training with mpirun.",
+    )
+
     # Other arguments of the training scripts
     parser.add_argument("training_script_args", nargs=argparse.REMAINDER, help="Arguments of the training script.")
 
@@ -667,6 +727,7 @@ def multi_gpu_launcher(args):
         distrib_run.get_args_parser(),
         ["--training_script", args.training_script, "--training_script_args", args.training_script_args],
     )
+
     with patch_environment(**current_env):
         try:
             distrib_run.run(args)
@@ -684,6 +745,8 @@ def deepspeed_launcher(args):
 
     if not is_deepspeed_available():
         raise ImportError("DeepSpeed is not installed => run `pip3 install deepspeed` or build it from source.")
+    else:
+        from deepspeed.launcher.runner import DEEPSPEED_ENVIRONMENT_NAME
 
     cmd, current_env = prepare_deepspeed_cmd_env(args)
     if not check_cuda_p2p_ib_support():
@@ -699,11 +762,10 @@ def deepspeed_launcher(args):
             logger.warning(message)
 
     if args.num_machines > 1 and args.deepspeed_multinode_launcher != DEEPSPEED_MULTINODE_LAUNCHERS[1]:
-        with open(".deepspeed_env", "a") as f:
-            for key, value in current_env.items():
-                if ";" in value or " " in value:
-                    continue
-                f.write(f"{key}={value}\n")
+        with open(DEEPSPEED_ENVIRONMENT_NAME, "a") as f:
+            valid_env_items = convert_dict_to_env_variables(current_env)
+            if len(valid_env_items) > 1:
+                f.writelines(valid_env_items)
 
         process = subprocess.Popen(cmd, env=current_env)
         process.wait()
@@ -868,7 +930,12 @@ def _validate_launch_command(args):
             args.multi_gpu = (
                 True
                 if defaults.distributed_type
-                in (DistributedType.MULTI_GPU, DistributedType.MULTI_NPU, DistributedType.MULTI_XPU)
+                in (
+                    DistributedType.MULTI_GPU,
+                    DistributedType.MULTI_NPU,
+                    DistributedType.MULTI_MLU,
+                    DistributedType.MULTI_XPU,
+                )
                 else False
             )
             args.tpu = defaults.distributed_type == DistributedType.XLA
@@ -906,6 +973,8 @@ def _validate_launch_command(args):
                         setattr(args, k, defaults.dynamo_config[k])
                     for k in defaults.ipex_config:
                         setattr(args, k, defaults.ipex_config[k])
+                    for k in defaults.mpirun_config:
+                        setattr(args, k, defaults.mpirun_config[k])
                     continue
 
                 # Those args are handled separately
@@ -942,6 +1011,8 @@ def _validate_launch_command(args):
         if args.num_processes is None:
             if args.use_xpu and is_xpu_available():
                 args.num_processes = torch.xpu.device_count()
+            elif is_mlu_available():
+                args.num_processes = torch.mlu.device_count()
             elif is_npu_available():
                 args.num_processes = torch.npu.device_count()
             else:
@@ -951,6 +1022,7 @@ def _validate_launch_command(args):
             args.debug = False
         if not args.multi_gpu and (
             (args.use_xpu and is_xpu_available() and torch.xpu.device_count() > 1)
+            or (is_mlu_available() and torch.mlu.device_count() > 1)
             or (is_npu_available() and torch.npu.device_count() > 1)
             or (torch.cuda.device_count() > 1)
         ):
@@ -977,8 +1049,8 @@ def _validate_launch_command(args):
         defaults is not None and defaults.compute_environment != ComputeEnvironment.AMAZON_SAGEMAKER
     )
     if is_aws_env_disabled and args.num_cpu_threads_per_process is None:
-        args.num_cpu_threads_per_process = 1
-        if args.use_cpu and args.num_processes >= 1:
+        args.num_cpu_threads_per_process = get_int_from_env(["OMP_NUM_THREADS"], 1)
+        if args.use_cpu and args.num_processes >= 1 and get_int_from_env(["OMP_NUM_THREADS"], 0) == 0:
             local_size = get_int_from_env(
                 ["MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE", "MV2_COMM_WORLD_LOCAL_SIZE"], 1
             )

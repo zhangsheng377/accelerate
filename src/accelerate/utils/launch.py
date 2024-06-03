@@ -14,9 +14,11 @@
 
 import argparse
 import os
+import subprocess
 import sys
 import warnings
 from ast import literal_eval
+from shutil import which
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -26,6 +28,7 @@ from ..utils import (
     DynamoBackend,
     PrecisionType,
     is_ipex_available,
+    is_mlu_available,
     is_npu_available,
     is_torch_xla_available,
     is_xpu_available,
@@ -46,6 +49,30 @@ def _filter_args(args, parser, default_args=[]):
     return new_args
 
 
+def _get_mpirun_args():
+    """
+    Determines the executable and argument names for mpirun, based on the type of install. The supported MPI programs
+    are: OpenMPI, Intel MPI, or MVAPICH.
+
+    Returns: Program name and arg names for hostfile, num processes, and processes per node
+    """
+    # Find the MPI program name
+    mpi_apps = [x for x in ["mpirun", "mpiexec"] if which(x)]
+
+    if len(mpi_apps) == 0:
+        raise OSError("mpirun or mpiexec were not found. Ensure that Intel MPI, Open MPI, or MVAPICH are installed.")
+
+    # Call the app with the --version flag to determine which MPI app is installed
+    mpi_app = mpi_apps[0]
+    mpirun_version = subprocess.check_output([mpi_app, "--version"])
+
+    if b"Open MPI" in mpirun_version:
+        return mpi_app, "--hostfile", "-n", "--npernode"
+    else:
+        # Intel MPI and MVAPICH both use the same arg names
+        return mpi_app, "-f", "-n", "-ppn"
+
+
 def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> Tuple[List[str], Dict[str, str]]:
     """
     Prepares and returns the command list and an environment with the correct simple launcher environment variables.
@@ -53,6 +80,16 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> Tuple[List[str]
     cmd = []
     if args.no_python and args.module:
         raise ValueError("--module and --no_python cannot be used together")
+
+    if args.mpirun_hostfile is not None:
+        mpi_app_name, hostfile_arg, num_proc_arg, proc_per_node_arg = _get_mpirun_args()
+        mpirun_ccl = getattr(args, "mpirun_ccl", None)
+        num_machines = args.num_machines
+        num_processes = getattr(args, "num_processes", None)
+        nproc_per_node = str(num_processes // num_machines) if num_processes and num_machines else "1"
+        cmd += [mpi_app_name, hostfile_arg, args.mpirun_hostfile, proc_per_node_arg, nproc_per_node]
+        if num_processes:
+            cmd += [num_proc_arg, str(num_processes)]
     if not args.no_python:
         cmd.append(sys.executable)
         if args.module:
@@ -67,6 +104,8 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> Tuple[List[str]
     if args.gpu_ids != "all" and args.gpu_ids is not None:
         if is_xpu_available():
             current_env["ZE_AFFINITY_MASK"] = args.gpu_ids
+        elif is_mlu_available():
+            current_env["MLU_VISIBLE_DEVICES"] = args.gpu_ids
         elif is_npu_available():
             current_env["ASCEND_RT_VISIBLE_DEVICES"] = args.gpu_ids
         else:
@@ -74,6 +113,9 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> Tuple[List[str]
     if args.num_machines > 1:
         current_env["MASTER_ADDR"] = args.main_process_ip
         current_env["MASTER_PORT"] = str(args.main_process_port)
+
+        if args.mpirun_hostfile is not None:
+            current_env["CCL_WORKER_COUNT"] = mpirun_ccl
     elif args.num_processes > 1:
         current_env["MASTER_ADDR"] = args.main_process_ip if args.main_process_ip is not None else "127.0.0.1"
         current_env["MASTER_PORT"] = str(args.main_process_port) if args.main_process_port is not None else "29500"
@@ -102,6 +144,8 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> Tuple[List[str]
     if is_ipex_available():
         current_env["ACCELERATE_USE_IPEX"] = str(args.ipex).lower()
         current_env["ACCELERATE_USE_XPU"] = str(args.use_xpu).lower()
+    if args.enable_cpu_affinity:
+        current_env["ACCELERATE_CPU_AFFINITY"] = "1"
     return cmd, current_env
 
 
@@ -136,7 +180,7 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> Dict[str, str]:
     if need_port_check and is_port_in_use(main_process_port):
         raise ConnectionError(
             f"Tried to launch distributed communication on port `{main_process_port}`, but another process is utilizing it. "
-            "Please specify a different port (such as using the `----main_process_port` flag or specifying a different `main_process_port` in your config file)"
+            "Please specify a different port (such as using the `--main_process_port` flag or specifying a different `main_process_port` in your config file)"
             " and rerun your script. To automatically use the next open port (on a single node), you can set this to `0`."
         )
 
@@ -154,6 +198,8 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> Dict[str, str]:
     if gpu_ids != "all" and args.gpu_ids is not None:
         if is_xpu_available():
             current_env["ZE_AFFINITY_MASK"] = gpu_ids
+        elif is_mlu_available():
+            current_env["MLU_VISIBLE_DEVICES"] = gpu_ids
         elif is_npu_available():
             current_env["ASCEND_RT_VISIBLE_DEVICES"] = gpu_ids
         else:
@@ -204,6 +250,7 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> Dict[str, str]:
         current_env["FSDP_USE_ORIG_PARAMS"] = str(args.fsdp_use_orig_params).lower()
         current_env["FSDP_CPU_RAM_EFFICIENT_LOADING"] = str(args.fsdp_cpu_ram_efficient_loading).lower()
         current_env["FSDP_SYNC_MODULE_STATES"] = str(args.fsdp_sync_module_states).lower()
+        current_env["FSDP_ACTIVATION_CHECKPOINTING"] = str(args.fsdp_activation_checkpointing).lower()
 
     if args.use_megatron_lm:
         prefix = "MEGATRON_LM_"
@@ -221,6 +268,8 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> Dict[str, str]:
             current_env[prefix + "USE_DISTRIBUTED_OPTIMIZER"] = str(args.megatron_lm_use_distributed_optimizer)
 
     current_env["OMP_NUM_THREADS"] = str(args.num_cpu_threads_per_process)
+    if args.enable_cpu_affinity:
+        current_env["ACCELERATE_CPU_AFFINITY"] = "1"
     return current_env
 
 
@@ -258,6 +307,8 @@ def prepare_deepspeed_cmd_env(args: argparse.Namespace) -> Tuple[List[str], Dict
             )
         else:
             cmd.extend(["--num_gpus", str(args.num_processes // args.num_machines)])
+        if main_process_ip:
+            cmd.extend(["--master_addr", str(main_process_ip)])
         cmd.extend(["--master_port", str(main_process_port)])
         if args.module and args.no_python:
             raise ValueError("--module and --no_python cannot be used together")
@@ -290,7 +341,7 @@ def prepare_deepspeed_cmd_env(args: argparse.Namespace) -> Tuple[List[str], Dict
     if need_port_check and is_port_in_use(main_process_port):
         raise ConnectionError(
             f"Tried to launch distributed communication on port `{main_process_port}`, but another process is utilizing it. "
-            "Please specify a different port (such as using the `----main_process_port` flag or specifying a different `main_process_port` in your config file)"
+            "Please specify a different port (such as using the `--main_process_port` flag or specifying a different `main_process_port` in your config file)"
             " and rerun your script. To automatically use the next open port (on a single node), you can set this to `0`."
         )
 
@@ -308,6 +359,8 @@ def prepare_deepspeed_cmd_env(args: argparse.Namespace) -> Tuple[List[str], Dict
     if gpu_ids != "all" and args.gpu_ids is not None:
         if is_xpu_available():
             current_env["ZE_AFFINITY_MASK"] = gpu_ids
+        elif is_mlu_available():
+            current_env["MLU_VISIBLE_DEVICES"] = gpu_ids
         elif is_npu_available():
             current_env["ASCEND_RT_VISIBLE_DEVICES"] = gpu_ids
         else:
@@ -339,6 +392,10 @@ def prepare_deepspeed_cmd_env(args: argparse.Namespace) -> Tuple[List[str], Dict
         current_env["ACCELERATE_DEEPSPEED_ZERO3_SAVE_16BIT_MODEL"] = str(args.zero3_save_16bit_model).lower()
     if args.deepspeed_config_file is not None:
         current_env["ACCELERATE_DEEPSPEED_CONFIG_FILE"] = str(args.deepspeed_config_file)
+    if args.enable_cpu_affinity:
+        current_env["ACCELERATE_CPU_AFFINITY"] = "1"
+    if args.deepspeed_moe_layer_cls_names is not None:
+        current_env["ACCELERATE_DEEPSPEED_MOE_LAYER_CLS_NAMES"] = str(args.deepspeed_moe_layer_cls_names)
     return cmd, current_env
 
 
@@ -555,6 +612,7 @@ class PrepareForLaunch:
             )
         elif self.distributed_type in (
             DistributedType.MULTI_GPU,
+            DistributedType.MULTI_MLU,
             DistributedType.MULTI_NPU,
             DistributedType.MULTI_XPU,
             DistributedType.MULTI_CPU,
